@@ -1,0 +1,11 @@
+recordings/
+workflows/
+processed/
+.DS_Store
+.env
+.venv/
+__pycache__/
+workflow_automation/processed/*
+workflow_automation/.venv/
+workflow_automation/recordings/*
+workflow_automation/workflows/*
