@@ -150,6 +150,7 @@ class WorkflowExtractor:
         processor = VideoProcessor(
             fps=2.0,  # Extract 2 frames per second
             openai_api_key=openai_api_key,
+            logger=self.logger,
         )
         
         session = processor.process(
@@ -239,6 +240,13 @@ class WorkflowExtractor:
             self._log(f"  - {len(workflow.instructions)} chars of instructions")
         
         workflow.source_session_id = session.session_id
+        
+        # Store processed session path for reference frames during execution
+        workflow.processed_session_path = str(session.output_dir)
+        
+        # Build reference frame mapping from events to frame paths
+        self._populate_reference_frames(workflow, understanding, events, frames)
+        
         return workflow
     
     def extract_from_processed_session_legacy(
@@ -1502,6 +1510,84 @@ class WorkflowExtractor:
             self._log(f"  Parameters: {len(workflow.parameters)}")
         
         return workflow
+    
+    def _populate_reference_frames(
+        self,
+        workflow: Workflow,
+        understanding: RunningUnderstanding,
+        events: list[DetectedEvent],
+        frames: list,  # List of FrameInfo
+    ) -> None:
+        """Populate reference frame paths for each step in the workflow.
+        
+        Maps the detected events to their corresponding frames, allowing
+        the executor to reference the original recording frames when stuck.
+        
+        Args:
+            workflow: The generated workflow to populate.
+            understanding: The running understanding with step-to-event mappings.
+            events: List of detected events from Pass 1.
+            frames: List of FrameInfo objects from the processed session.
+        """
+        # Build a mapping of step number to reference frames
+        # The understanding.steps contain related_events indices
+        step_frames: dict[int, tuple[list[str], list[float]]] = {}
+        
+        for step in understanding.steps:
+            frame_paths: list[str] = []
+            frame_timestamps: list[float] = []
+            
+            # Collect frames from all related events
+            for event_idx in step.related_events:
+                if 0 <= event_idx < len(events):
+                    event = events[event_idx]
+                    for frame_idx in event.frame_indices:
+                        if 0 <= frame_idx < len(frames):
+                            frame = frames[frame_idx]
+                            path_str = str(frame.path)
+                            # Avoid duplicates
+                            if path_str not in frame_paths:
+                                frame_paths.append(path_str)
+                                frame_timestamps.append(frame.timestamp)
+            
+            # Also add the frame closest to the event timestamp
+            for event_idx in step.related_events:
+                if 0 <= event_idx < len(events):
+                    event = events[event_idx]
+                    # Find closest frame to event timestamp
+                    closest_frame = min(
+                        frames,
+                        key=lambda f: abs(f.timestamp - event.timestamp),
+                        default=None,
+                    )
+                    if closest_frame:
+                        path_str = str(closest_frame.path)
+                        if path_str not in frame_paths:
+                            frame_paths.append(path_str)
+                            frame_timestamps.append(closest_frame.timestamp)
+            
+            step_frames[step.step_number] = (frame_paths, frame_timestamps)
+        
+        # Store the reference frame data in the workflow's instructions as JSON metadata
+        # This will be available during execution for the reference frames tool
+        reference_data = {
+            "step_reference_frames": {
+                str(step_num): {
+                    "paths": paths,
+                    "timestamps": timestamps,
+                }
+                for step_num, (paths, timestamps) in step_frames.items()
+            }
+        }
+        
+        # Append reference frame metadata as a hidden section in the workflow
+        if step_frames:
+            reference_section = (
+                "\n\n<!-- REFERENCE_FRAMES_METADATA\n"
+                f"{json.dumps(reference_data, indent=2)}\n"
+                "-->\n"
+            )
+            workflow.instructions += reference_section
     
     def _build_synthesis_message(
         self,

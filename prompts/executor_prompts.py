@@ -55,6 +55,28 @@ After each step, take a screenshot and carefully evaluate if you have achieved t
 - Wait for UI to settle after actions that trigger loading
 - Substitute ALL parameter placeholders with actual values
 
+## Reference Frames (Fallback)
+
+If you get stuck on a step and the screen doesn't look as expected, you may have access to a `reference_frames` tool. Use this tool to see what the screen looked like when the human performed this step in the original recording.
+
+**When to use reference_frames:**
+- The UI looks different than expected and you can't find an element
+- You've tried multiple approaches without success  
+- You're unsure what the correct screen state should be
+
+**How to use:**
+```
+reference_frames(step_number=N)  # Get frames for step N
+reference_frames(timestamp=T)   # Get frames near timestamp T seconds
+```
+
+The reference frames show the exact screen state from the original demo, which can help you:
+- Identify the correct UI elements or buttons to click
+- Understand what the expected result should look like
+- See alternative approaches the human used
+
+Use this as a FALLBACK after trying normal approaches first.
+
 ## When You're Done
 
 Stop calling tools and provide a summary of what was accomplished.

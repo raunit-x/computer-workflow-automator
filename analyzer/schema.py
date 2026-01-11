@@ -109,6 +109,8 @@ class WorkflowStep:
     details: str
     related_events: list[int]  # Indices of DetectedEvents
     voice_context: str | None = None  # Relevant transcript content
+    reference_frame_paths: list[str] = field(default_factory=list)  # Paths to frames for this step
+    reference_frame_timestamps: list[float] = field(default_factory=list)  # Timestamps of frames
     
     def to_dict(self) -> dict:
         return {
@@ -120,6 +122,8 @@ class WorkflowStep:
             "details": self.details,
             "related_events": self.related_events,
             "voice_context": self.voice_context,
+            "reference_frame_paths": self.reference_frame_paths,
+            "reference_frame_timestamps": self.reference_frame_timestamps,
         }
     
     @classmethod
@@ -133,6 +137,8 @@ class WorkflowStep:
             details=d.get("details", ""),
             related_events=d.get("related_events", []),
             voice_context=d.get("voice_context"),
+            reference_frame_paths=d.get("reference_frame_paths", []),
+            reference_frame_timestamps=d.get("reference_frame_timestamps", []),
         )
 
 
@@ -273,6 +279,7 @@ class Workflow:
     instructions: str  # The markdown body with detailed instructions
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     source_session_id: str | None = None
+    processed_session_path: str | None = None  # Path to processed/ folder with reference frames
     
     def to_markdown(self) -> str:
         """Convert to markdown format with YAML frontmatter."""
@@ -286,6 +293,9 @@ class Workflow:
         
         if self.source_session_id:
             frontmatter["source_session_id"] = self.source_session_id
+        
+        if self.processed_session_path:
+            frontmatter["processed_session_path"] = self.processed_session_path
         
         if self.parameters:
             frontmatter["parameters"] = [p.to_dict() for p in self.parameters]
@@ -313,6 +323,7 @@ class Workflow:
             instructions=instructions.strip(),
             created_at=frontmatter.get("created_at", datetime.now().isoformat()),
             source_session_id=frontmatter.get("source_session_id"),
+            processed_session_path=frontmatter.get("processed_session_path"),
         )
     
     @staticmethod
@@ -402,6 +413,7 @@ class Workflow:
             "instructions": self.instructions,
             "created_at": self.created_at,
             "source_session_id": self.source_session_id,
+            "processed_session_path": self.processed_session_path,
         }
     
     @classmethod
@@ -426,6 +438,7 @@ class Workflow:
             instructions=instructions,
             created_at=d.get("created_at", datetime.now().isoformat()),
             source_session_id=d.get("source_session_id"),
+            processed_session_path=d.get("processed_session_path"),
         )
     
     @staticmethod

@@ -230,6 +230,19 @@ pyautogui.PAUSE = 0.1       # Small pause between actions
 - If JSON parsing fails, falls back to previous understanding
 - If transcription fails, workflow still generates from visual analysis
 
+**Reference Frames Fallback**:
+When the agent gets stuck during execution, it can access the original recording frames as a fallback:
+- **Auto-trigger**: After 3 consecutive failed attempts on the same action
+- **Agent-requested**: Claude can call `reference_frames(step_number=N)` when stuck
+- Shows what the screen looked like when the human performed that step
+- Helps identify correct UI elements when the interface has changed
+
+```python
+# Agent can request reference frames when stuck
+reference_frames(step_number=5)   # Get frames for step 5
+reference_frames(timestamp=30.0)  # Get frames near 30s mark
+```
+
 ---
 
 ## Key Design Decisions
@@ -246,6 +259,7 @@ pyautogui.PAUSE = 0.1       # Small pause between actions
 | **Model routing** | Gemini Flash + Claude Sonnet | Cost optimization (~10x cheaper for Pass 1) |
 | **LLM abstraction** | Unified LLMClient | Provider-agnostic, easy to swap models |
 | **Verification loop** | Screenshot after action | Ensures each step succeeded before proceeding |
+| **Reference frames fallback** | Original recording frames | Helps agent recover when stuck on a step |
 | **Image format** | JPEG 80% quality | Balances quality vs API payload size |
 | **Package manager** | uv | Fast, modern Python tooling |
 
@@ -254,23 +268,9 @@ pyautogui.PAUSE = 0.1       # Small pause between actions
 ## Limitations
 
 - **macOS only**: Uses macOS-specific features (screencapture, pyautogui)
-- **Gemini rate limits**: Free tier limited to 5 requests/minute (handled with batching)
-- **No conditional branching**: Workflows are linear; no if/else based on screen state
-- **Single monitor**: Multi-monitor support not yet implemented
 - **Accessibility permissions**: Must manually grant terminal permissions
 - **Network required**: API calls to Anthropic, OpenAI, and optionally Google
-
----
-
-## Possible Extensions
-
-- Windows/Linux support via platform-specific computer tools
-- Multi-monitor handling
-- Workflow branching (if/else based on screen state)
-- Workflow composition (chain multiple workflows)
-- Local Whisper model option (faster, no API cost)
-- Workflow versioning and diff
-- Cloud execution mode
+- **Expensive**: A 3 min workflow with sonnet 4.5 would cost ~$10-20
 
 ---
 
@@ -554,9 +554,3 @@ Ensure the terminal has accessibility permissions and try:
 ```bash
 uv run python -c "import pyautogui; print(pyautogui.position())"
 ```
-
----
-
-## License
-
-See LICENSE file in the parent directory.

@@ -20,11 +20,15 @@ from anthropic.types.beta import (
 )
 
 from .macos_computer import MacOSComputerTool, ToolResult, ToolError
+from .reference_frames_tool import ReferenceFramesTool
 from prompts.executor_prompts import WORKFLOW_SYSTEM_PROMPT
 
 if TYPE_CHECKING:
     from utils.logger import WorkflowLogger
     from utils.tracking import CostTracker
+
+# Retry threshold for auto-injecting reference frames
+RETRY_THRESHOLD = 3
 
 
 def _format_parameters_section(parameters: dict[str, Any]) -> str:
@@ -57,6 +61,7 @@ async def workflow_sampling_loop(
     max_iterations: int = 100,
     logger: "WorkflowLogger | None" = None,
     cost_tracker: "CostTracker | None" = None,
+    processed_session_path: str | None = None,
 ) -> list[BetaMessageParam]:
     """
     Agentic sampling loop for executing a learned workflow.
@@ -75,12 +80,23 @@ async def workflow_sampling_loop(
         max_iterations: Maximum number of loop iterations.
         logger: Optional WorkflowLogger for structured output.
         cost_tracker: Optional CostTracker for cost accumulation.
+        processed_session_path: Path to processed session for reference frames.
         
     Returns:
         List of conversation messages.
     """
     client = Anthropic(api_key=api_key) if api_key else Anthropic()
     computer_tool = MacOSComputerTool()
+    
+    # Initialize reference frames tool if session path is available
+    reference_frames_tool = ReferenceFramesTool(processed_session_path=processed_session_path)
+    reference_frames_tool.set_workflow_context(processed_session_path, workflow_instructions)
+    reference_frames_available = processed_session_path is not None
+    
+    # Tracking for retry detection and reference frame injection
+    consecutive_errors = 0
+    last_action_description = ""
+    reference_frames_injected = False
     
     # Track token usage for cost calculation
     total_input_tokens = 0
@@ -153,6 +169,13 @@ async def workflow_sampling_loop(
         if iteration_callback:
             iteration_callback(iteration, max_iterations)
         
+        # Build tools list - always include computer, optionally include reference_frames
+        tools_list: list[BetaToolUnionParam] = [
+            cast(BetaToolUnionParam, computer_tool.to_params())
+        ]
+        if reference_frames_available:
+            tools_list.append(cast(BetaToolUnionParam, reference_frames_tool.to_params()))
+        
         try:
             log_step(f"Calling API with model: {model}")
             raw_response = client.beta.messages.with_raw_response.create(
@@ -160,7 +183,7 @@ async def workflow_sampling_loop(
                 messages=messages,
                 model=model,
                 system=[system],
-                tools=[cast(BetaToolUnionParam, computer_tool.to_params())],
+                tools=tools_list,
                 betas=["computer-use-2025-01-24"],
             )
             log_info("API call succeeded")
@@ -208,6 +231,7 @@ async def workflow_sampling_loop(
         
         # Process tool calls
         tool_result_content: list[BetaToolResultBlockParam] = []
+        had_error_this_iteration = False
         
         for content_block in response_params:
             if output_callback:
@@ -221,15 +245,38 @@ async def workflow_sampling_loop(
                 log_tool(tool_name, action)
                 
                 try:
-                    result = await computer_tool(
-                        **cast(dict[str, Any], tool_use_block.get("input", {}))
-                    )
+                    if tool_name == "reference_frames":
+                        # Handle reference_frames tool
+                        result = await reference_frames_tool(
+                            **cast(dict[str, Any], tool_use_block.get("input", {}))
+                        )
+                        log_info("Reference frames retrieved")
+                    else:
+                        # Handle computer tool
+                        result = await computer_tool(
+                            **cast(dict[str, Any], tool_use_block.get("input", {}))
+                        )
                 except ToolError as e:
                     result = ToolResult(error=e.message)
                     log_error(f"Tool error: {e.message}")
+                    had_error_this_iteration = True
                 except Exception as e:
                     result = ToolResult(error=str(e))
                     log_error(f"Tool exception: {e}")
+                    had_error_this_iteration = True
+                
+                # Track current action for error detection
+                if tool_name == "computer" and action != "screenshot":
+                    current_action = f"{action}:{tool_input}"
+                    if result.error:
+                        if current_action == last_action_description:
+                            consecutive_errors += 1
+                        else:
+                            consecutive_errors = 1
+                        last_action_description = current_action
+                    else:
+                        consecutive_errors = 0
+                        last_action_description = ""
                 
                 tool_result_content.append(
                     _make_api_tool_result(result, tool_use_block["id"])
@@ -237,6 +284,28 @@ async def workflow_sampling_loop(
                 
                 if tool_output_callback:
                     tool_output_callback(result, tool_use_block["id"])
+        
+        # Auto-inject reference frames hint if stuck
+        if (reference_frames_available and 
+            not reference_frames_injected and
+            consecutive_errors >= RETRY_THRESHOLD):
+            log_info(f"Detected {consecutive_errors} consecutive errors - suggesting reference frames")
+            reference_frames_injected = True
+            # Add a hint message to suggest using reference frames
+            hint_message: BetaToolResultBlockParam = {
+                "type": "tool_result",
+                "tool_use_id": "system_hint",
+                "content": (
+                    "⚠️ You appear to be stuck on this step after multiple attempts. "
+                    "Consider using the `reference_frames` tool to see what the screen "
+                    "looked like when the human performed this step in the original recording. "
+                    "This may help you identify the correct UI elements or understand the expected state."
+                ),
+                "is_error": False,
+            }
+            # We can't add this directly as a tool result, but we can note it in logs
+            # The prompt already mentions this capability
+            log_info("Hint: Use reference_frames tool to see original recording")
         
         # If no tool calls, the model is done
         if not tool_result_content:

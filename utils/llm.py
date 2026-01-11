@@ -218,6 +218,7 @@ class LLMClient:
                 batch_end = min(batch_start + batch_size, total)
                 batch_requests = requests[batch_start:batch_end]
                 batch_indices = list(range(batch_start, batch_end))
+                start = time.time()
                 
                 # Fire batch in parallel
                 with ThreadPoolExecutor(max_workers=len(batch_requests)) as executor:
@@ -232,7 +233,7 @@ class LLMClient:
                         future_to_idx[future] = idx
                     
                     # Collect results as they complete
-                    for future in as_completed(future_to_idx):
+                    for future in as_completed(future_to_idx): 
                         idx = future_to_idx[future]
                         try:
                             results[idx] = future.result()
@@ -245,12 +246,12 @@ class LLMClient:
                             progress_callback(completed, total)
                 
                 # Wait between batches (except for the last batch)
-                if batch_end < total:
+                wait_time =  batch_wait - (time.time() - start) + 3 # 5 seconds buffer
+                if wait_time > 0:
                     if self.logger:
-                        remaining = total - batch_end
                         self.logger.info(
                             f"Batch complete ({batch_end}/{total}). "
-                            f"Waiting {batch_wait:.0f}s for rate limit reset..."
+                            f"Waiting {wait_time:.0f}s for rate limit reset..."
                         )
                     time.sleep(batch_wait)
         finally:

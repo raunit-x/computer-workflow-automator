@@ -136,6 +136,7 @@ class WorkflowRunner:
                 max_iterations=self.max_iterations,
                 logger=self.logger,
                 cost_tracker=self.cost_tracker,
+                processed_session_path=workflow.processed_session_path,
             )
             
             if self.logger:
