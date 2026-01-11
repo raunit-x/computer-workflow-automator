@@ -2,39 +2,32 @@
 
 import json
 import re
-from typing import Any
-
-from anthropic import Anthropic
+from typing import Any, TYPE_CHECKING
 
 from .schema import Parameter, ParameterType, Workflow
-from .json_utils import extract_json_from_response
 from prompts.analyzer_prompts import PARAMETER_DETECTION_PROMPT
+
+if TYPE_CHECKING:
+    from utils.llm import LLMClient
+    from config import ModelConfig
 
 
 class ParameterDetector:
-    """Detects and suggests parameters for workflows."""
+    """Detects and suggests parameters for workflows using LLMClient."""
     
     def __init__(
         self,
-        api_key: str | None = None,
-        model: str = "claude-sonnet-4-5-20250929",
-        use_openai: bool = False,
+        model_config: "ModelConfig",
+        llm_client: "LLMClient",
     ):
         """Initialize the detector.
         
         Args:
-            api_key: API key. If not provided, uses ANTHROPIC_API_KEY or OPENAI_API_KEY env var.
-            model: Model to use.
-            use_openai: If True, use OpenAI API instead of Anthropic.
+            model_config: ModelConfig with stage-specific model settings.
+            llm_client: Unified LLMClient for API calls.
         """
-        self.use_openai = use_openai
-        self.model = model
-        
-        if use_openai:
-            from openai import OpenAI
-            self.client: Any = OpenAI(api_key=api_key) if api_key else OpenAI()
-        else:
-            self.client = Anthropic(api_key=api_key) if api_key else Anthropic()
+        self.model_config = model_config
+        self.llm = llm_client
     
     def detect_parameters(self, workflow: Workflow) -> list[Parameter]:
         """Detect suggested parameters for a workflow.
@@ -61,27 +54,18 @@ class ParameterDetector:
         
         user_message = f"Analyze this workflow and suggest parameters that are NOT already defined:\n\n{workflow_content}\n\nOutput ONLY the JSON object."
         
-        if self.use_openai:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                max_completion_tokens=4096,
-                messages=[
-                    {"role": "system", "content": PARAMETER_DETECTION_PROMPT},
-                    {"role": "user", "content": user_message},
-                ],
-            )
-            response_text = response.choices[0].message.content.strip()
-        else:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=PARAMETER_DETECTION_PROMPT,
-                messages=[{"role": "user", "content": user_message}],
-            )
-            response_text = response.content[0].text.strip()
-        
-        # Extract and parse JSON
-        data = extract_json_from_response(response_text, json_type="object", default={})
+        # Use LLMClient with parameter detection model
+        content = [{"type": "text", "text": user_message}]
+        data = self.llm.generate(
+            model=self.model_config.parameter_detection,
+            system_prompt=PARAMETER_DETECTION_PROMPT,
+            content=content,
+            max_tokens=4096,
+            parse_json=True,
+            json_type="object",
+            default_json={},
+            phase="parameter_detection",
+        )
         
         # Convert to Parameter objects
         parameters = []
@@ -92,9 +76,15 @@ class ParameterDetector:
             if p["name"] in existing_names:
                 continue
             
+            # Handle unknown parameter types gracefully
+            try:
+                param_type = ParameterType(p.get("type", "string"))
+            except ValueError:
+                param_type = ParameterType.STRING
+            
             parameters.append(Parameter(
                 name=p["name"],
-                param_type=ParameterType(p.get("type", "string")),
+                param_type=param_type,
                 description=p.get("description", ""),
                 default_value=p.get("default"),
                 required=p.get("required", True),

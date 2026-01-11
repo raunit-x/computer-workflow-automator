@@ -1,4 +1,4 @@
-"""Workflow extraction from video recordings using Claude or OpenAI."""
+"""Workflow extraction from video recordings using LLM providers."""
 
 import base64
 import io
@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from anthropic import Anthropic
 from PIL import Image
 from tqdm import tqdm
 
@@ -26,11 +25,16 @@ from prompts.analyzer_prompts import (
 if TYPE_CHECKING:
     from recorder.video_processor import ProcessedSession
     from utils.logger import WorkflowLogger
-    from utils.tracking import CostTracker
+    from utils.llm import LLMClient
+    from config import ModelConfig
 
 
 class WorkflowExtractor:
-    """Extracts structured workflows from video recordings using Claude or OpenAI."""
+    """Extracts structured workflows from video recordings using LLM providers.
+    
+    Uses a unified LLMClient that supports Anthropic, OpenAI, and Gemini,
+    with configurable models for each extraction stage.
+    """
     
     # Maximum image dimension for API requests (to avoid request size limits)
     MAX_IMAGE_DIMENSION = 1280
@@ -39,34 +43,23 @@ class WorkflowExtractor:
     
     def __init__(
         self,
-        api_key: str | None = None,
-        model: str = "claude-sonnet-4-5-20250929",
-        use_openai: bool = False,
+        model_config: "ModelConfig",
+        llm_client: "LLMClient",
         max_image_dimension: int | None = None,
         logger: "WorkflowLogger | None" = None,
-        cost_tracker: "CostTracker | None" = None,
     ):
         """Initialize the extractor.
         
         Args:
-            api_key: API key. If not provided, uses ANTHROPIC_API_KEY or OPENAI_API_KEY env var.
-            model: Model to use for extraction.
-            use_openai: If True, use OpenAI API instead of Anthropic.
+            model_config: ModelConfig with stage-specific model settings.
+            llm_client: Unified LLMClient for API calls.
             max_image_dimension: Maximum dimension for resized images (default 1280).
             logger: Optional WorkflowLogger for structured output.
-            cost_tracker: Optional CostTracker for cost accumulation.
         """
-        self.use_openai = use_openai
-        self.model = model
+        self.model_config = model_config
+        self.llm = llm_client
         self.max_image_dimension = max_image_dimension or self.MAX_IMAGE_DIMENSION
         self.logger = logger
-        self.cost_tracker = cost_tracker
-        
-        if use_openai:
-            from openai import OpenAI
-            self.client: Any = OpenAI(api_key=api_key) if api_key else OpenAI()
-        else:
-            self.client = Anthropic(api_key=api_key) if api_key else Anthropic()
     
     def _log(self, message: str, level: str = "info") -> None:
         """Log a message using the logger or print."""
@@ -85,13 +78,6 @@ class WorkflowExtractor:
                 self.logger.header(message)
         else:
             print(message)
-    
-    def _track_usage(self, input_tokens: int, output_tokens: int, phase: str) -> None:
-        """Track API usage if cost_tracker is available."""
-        if self.cost_tracker:
-            self.cost_tracker.add_usage(input_tokens, output_tokens, phase=phase)
-        if self.logger:
-            self.logger.api(input_tokens, output_tokens)
     
     def _resize_and_encode_image(self, image_path: Path) -> tuple[str, str]:
         """Resize image if needed and return base64-encoded data.
@@ -260,11 +246,10 @@ class WorkflowExtractor:
         session: "ProcessedSession",
         max_frames: int = 30,
     ) -> Workflow:
-        """Legacy single-pass extraction (kept for backward compatibility).
+        """Legacy single-pass extraction - DEPRECATED.
         
-        This method uses the original single-pass approach where frames are
-        sampled and sent in a single API call. Use extract_from_processed_session
-        for better results with the multi-pass approach.
+        This method is deprecated. Use extract_from_processed_session() instead,
+        which provides better results with the multi-pass approach.
         
         Args:
             session: ProcessedSession from VideoProcessor.
@@ -273,43 +258,18 @@ class WorkflowExtractor:
         Returns:
             Extracted Workflow object.
         """
-        # Sample frames if too many
-        frames = session.frames
-        if len(frames) > max_frames:
-            step = len(frames) // max_frames
-            frames = frames[::step][:max_frames]
-        
-        if self.use_openai:
-            # Build OpenAI-formatted message content
-            content = self._build_openai_message_from_session(
-                frames=frames,
-                transcript=session.transcript,
-                duration=session.duration,
-            )
-            response_text = self._call_openai(content)
-        else:
-            # Build Anthropic-formatted message content
-            content = self._build_extraction_message_from_session(
-                frames=frames,
-                transcript=session.transcript,
-                duration=session.duration,
-            )
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=8192,
-                system=EXTRACTION_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": content}],
-            )
-            response_text = response.content[0].text
-        
-        # Parse the markdown response
-        markdown_content = self._extract_markdown(response_text)
-        
-        # Create workflow from markdown
-        workflow = Workflow.from_markdown(markdown_content)
-        workflow.source_session_id = session.session_id
-        
-        return workflow
+        import warnings
+        warnings.warn(
+            "extract_from_processed_session_legacy is deprecated. "
+            "Use extract_from_processed_session() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        # Redirect to the new method
+        return self.extract_from_processed_session(
+            session=session,
+            verbose=False,
+        )
     
     def extract_from_session(
         self,
@@ -367,26 +327,20 @@ class WorkflowExtractor:
             step = len(screenshot_paths) // max_screenshots
             screenshot_paths = screenshot_paths[::step][:max_screenshots]
         
-        if self.use_openai:
-            # Build OpenAI-formatted message content
-            content = self._build_openai_extraction_message(
-                session_data=session_data,
-                screenshot_paths=screenshot_paths,
-            )
-            response_text = self._call_openai(content)
-        else:
-            # Build the message content
-            content = self._build_extraction_message(
-                session_data=session_data,
-                screenshot_paths=screenshot_paths,
-            )
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=8192,
-                system=EXTRACTION_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": content}],
-            )
-            response_text = response.content[0].text
+        # Build unified content format for legacy extraction
+        content = self._build_legacy_extraction_content(
+            session_data=session_data,
+            screenshot_paths=screenshot_paths,
+        )
+        
+        # Use LLMClient with synthesis model for legacy extraction
+        response_text = self.llm.generate(
+            model=self.model_config.synthesis,
+            system_prompt=EXTRACTION_SYSTEM_PROMPT,
+            content=content,
+            max_tokens=8192,
+            phase="legacy_extraction",
+        )
         
         # Parse the markdown response
         markdown_content = self._extract_markdown(response_text)
@@ -396,6 +350,65 @@ class WorkflowExtractor:
         workflow.source_session_id = session_data.get("session_id")
         
         return workflow
+    
+    def _build_legacy_extraction_content(
+        self,
+        session_data: dict,
+        screenshot_paths: list[Path],
+    ) -> list[dict]:
+        """Build unified content format for legacy session extraction."""
+        content = []
+        
+        # Add text description
+        text_parts = ["# Screen Recording Analysis\n\n"]
+        text_parts.append("This is a screen recording of a workflow demonstration.\n\n")
+        
+        # Add metadata from session
+        if "duration" in session_data:
+            text_parts.append(f"Duration: {session_data['duration']:.1f} seconds\n")
+        if "click_count" in session_data:
+            text_parts.append(f"Mouse clicks: {session_data['click_count']}\n")
+        if "keystroke_count" in session_data:
+            text_parts.append(f"Keystrokes: {session_data['keystroke_count']}\n")
+        
+        text_parts.append(f"\nNumber of screenshots: {len(screenshot_paths)}\n")
+        
+        # Add transcript if available
+        if session_data.get("transcript"):
+            text_parts.append("\n## Voice-Over Transcript\n\n")
+            text_parts.append(session_data["transcript"])
+        elif session_data.get("audio_transcript"):
+            text_parts.append("\n## Voice-Over Transcript\n\n")
+            text_parts.append(session_data["audio_transcript"])
+        
+        content.append({"type": "text", "text": "".join(text_parts)})
+        
+        # Add screenshots in unified format
+        content.append({
+            "type": "text",
+            "text": f"\n## Screenshots ({len(screenshot_paths)} images)\n\n"
+        })
+        
+        for i, screenshot_path in enumerate(screenshot_paths):
+            # Resize and encode image
+            image_data, media_type = self._resize_and_encode_image(screenshot_path)
+            
+            content.append({
+                "type": "image",
+                "data": image_data,
+                "media_type": media_type,
+            })
+            content.append({
+                "type": "text",
+                "text": f"Screenshot {i + 1}"
+            })
+        
+        content.append({
+            "type": "text",
+            "text": "\n\nAnalyze this recording and create a comprehensive markdown workflow document."
+        })
+        
+        return content
     
     def _build_extraction_message_from_session(
         self,
@@ -513,18 +526,6 @@ class WorkflowExtractor:
         })
         
         return content
-    
-    def _call_openai(self, content: list[dict]) -> str:
-        """Call OpenAI API with vision content and return response text."""
-        response = self.client.chat.completions.create(
-            model=self.model,
-            max_completion_tokens=8192,
-            messages=[
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ],
-        )
-        return response.choices[0].message.content
     
     def _build_extraction_message(
         self,
@@ -678,31 +679,84 @@ class WorkflowExtractor:
         Returns:
             Extracted Workflow object.
         """
-        if self.use_openai:
-            content = self._build_openai_message_from_data(
-                screenshots=screenshots,
-                events=events,
-                transcript_text=transcript_text,
-                transcript_segments=transcript_segments,
-            )
-            response_text = self._call_openai(content)
-        else:
-            content = self._build_extraction_message_from_data(
-                screenshots=screenshots,
-                events=events,
-                transcript_text=transcript_text,
-                transcript_segments=transcript_segments,
-            )
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=8192,
-                system=EXTRACTION_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": content}],
-            )
-            response_text = response.content[0].text
+        # Build unified content format
+        content = self._build_data_extraction_content(
+            screenshots=screenshots,
+            events=events,
+            transcript_text=transcript_text,
+            transcript_segments=transcript_segments,
+        )
+        
+        # Use LLMClient with synthesis model
+        response_text = self.llm.generate(
+            model=self.model_config.synthesis,
+            system_prompt=EXTRACTION_SYSTEM_PROMPT,
+            content=content,
+            max_tokens=8192,
+            phase="data_extraction",
+        )
         
         markdown_content = self._extract_markdown(response_text)
         return Workflow.from_markdown(markdown_content)
+    
+    def _build_data_extraction_content(
+        self,
+        screenshots: list[tuple[Path, dict]],
+        events: list[dict],
+        transcript_text: str | None,
+        transcript_segments: list[dict] | None,
+    ) -> list[dict]:
+        """Build unified content for data extraction."""
+        content = []
+        
+        text_parts = ["# Recording Analysis\n\n"]
+        
+        # Events
+        if events:
+            text_parts.append("## Input Events\n\n")
+            for event in events[:100]:
+                text_parts.append(f"- [{event.get('timestamp', 0):.2f}s] {event.get('event_type', 'unknown')}: {event.get('data', {})}\n")
+        
+        # Transcript
+        if transcript_text:
+            text_parts.append("\n## Voice-Over Transcript\n\n")
+            text_parts.append(f"{transcript_text}\n")
+            
+            if transcript_segments:
+                text_parts.append("\n### Segments:\n")
+                for seg in transcript_segments:
+                    text_parts.append(f"- [{seg.get('start', 0):.1f}s - {seg.get('end', 0):.1f}s]: {seg.get('text', '')}\n")
+        
+        content.append({"type": "text", "text": "".join(text_parts)})
+        
+        # Add screenshots in unified format
+        if screenshots:
+            content.append({
+                "type": "text",
+                "text": f"\n## Screenshots ({len(screenshots)} images)\n\n"
+            })
+            
+            for i, (screenshot_path, metadata) in enumerate(screenshots):
+                image_data, media_type = self._resize_and_encode_image(screenshot_path)
+                
+                content.append({
+                    "type": "image",
+                    "data": image_data,
+                    "media_type": media_type,
+                })
+                
+                timestamp = metadata.get("timestamp", i)
+                content.append({
+                    "type": "text",
+                    "text": f"Screenshot {i + 1} at {timestamp}s"
+                })
+        
+        content.append({
+            "type": "text",
+            "text": "\n\nAnalyze this recording and create a comprehensive markdown workflow document."
+        })
+        
+        return content
     
     def _build_extraction_message_from_data(
         self,
@@ -862,6 +916,7 @@ class WorkflowExtractor:
         chunk_size: int = 10,
         overlap: int = 2,
         verbose: bool = True,
+        parallel: bool = True,
     ) -> list[DetectedEvent]:
         """Pass 1: Detect events from frames in overlapping chunks.
         
@@ -875,10 +930,13 @@ class WorkflowExtractor:
             chunk_size: Number of frames per chunk.
             overlap: Number of frames to overlap between chunks.
             verbose: Whether to print progress information.
+            parallel: Whether to use parallel batch processing (faster for Gemini).
             
         Returns:
             List of DetectedEvent objects in chronological order.
         """
+        from utils.tracking import detect_provider
+        
         all_events: list[DetectedEvent] = []
         total_frames = len(frames)
         
@@ -895,21 +953,55 @@ class WorkflowExtractor:
             self._log(f"Chunk size: {chunk_size} frames (overlap: {overlap})")
             self._log(f"Total chunks to process: {total_chunks}")
         
+        # Check if we should use parallel processing (only for Gemini)
+        provider = detect_provider(self.model_config.event_detection)
+        use_parallel = parallel and provider == "gemini"
+        
+        if use_parallel:
+            # Parallel batch processing for Gemini
+            all_events = self._detect_events_parallel(
+                chunks=chunks,
+                transcript=transcript,
+                verbose=verbose,
+            )
+        else:
+            # Sequential processing (for Anthropic/OpenAI or when parallel=False)
+            all_events = self._detect_events_sequential(
+                chunks=chunks,
+                transcript=transcript,
+                overlap=overlap,
+                verbose=verbose,
+            )
+        
+        if verbose:
+            self._log(f"Pass 1 complete: Detected {len(all_events)} events", level="success")
+        
+        return all_events
+    
+    def _detect_events_sequential(
+        self,
+        chunks: list,
+        transcript,
+        overlap: int,
+        verbose: bool,
+    ) -> list[DetectedEvent]:
+        """Sequential event detection (original approach)."""
+        all_events: list[DetectedEvent] = []
+        
         # Use tqdm for progress bar
         chunk_iterator = tqdm(
             enumerate(chunks),
-            total=total_chunks,
+            total=len(chunks),
             desc="Detecting events",
             unit="chunk",
             disable=not verbose,
         )
         
         for chunk_idx, (chunk_frames, start_idx) in chunk_iterator:
-            # Update progress bar description
-            chunk_iterator.set_postfix({
-                "frames": f"{start_idx + 1}-{start_idx + len(chunk_frames)}",
-                "events": len(all_events),
-            })
+            # Update progress bar description with frame range
+            chunk_iterator.set_postfix_str(
+                f"frames={start_idx + 1}-{start_idx + len(chunk_frames)}, events={len(all_events)}"
+            )
             
             # Get relevant transcript segments for this chunk
             chunk_start_time = chunk_frames[0].timestamp
@@ -918,18 +1010,90 @@ class WorkflowExtractor:
                 transcript, chunk_start_time, chunk_end_time
             )
             
-            # Detect events in this chunk
+            # Detect events in this chunk (passes tqdm bar for token updates)
             chunk_events = self._detect_events_in_chunk(
                 frames=chunk_frames,
                 start_frame_idx=start_idx,
                 transcript_text=relevant_transcript,
+                tqdm_bar=chunk_iterator,
             )
             
             # Merge events, handling overlap with previous chunk
             all_events = self._merge_events(all_events, chunk_events, overlap > 0)
         
+        return all_events
+    
+    def _detect_events_parallel(
+        self,
+        chunks: list,
+        transcript,
+        verbose: bool,
+    ) -> list[DetectedEvent]:
+        """Parallel batch event detection for Gemini (5 requests at a time)."""
+        from prompts.analyzer_prompts import EVENT_DETECTION_PROMPT
+        
+        total_chunks = len(chunks)
+        
         if verbose:
-            self._log(f"Pass 1 complete: Detected {len(all_events)} events", level="success")
+            self._log(f"Using parallel batch processing (5 chunks at a time)")
+        
+        # Build all requests upfront
+        requests = []
+        for chunk_idx, (chunk_frames, start_idx) in enumerate(chunks):
+            # Get relevant transcript segments for this chunk
+            chunk_start_time = chunk_frames[0].timestamp
+            chunk_end_time = chunk_frames[-1].timestamp
+            relevant_transcript = self._get_transcript_for_timerange(
+                transcript, chunk_start_time, chunk_end_time
+            )
+            
+            # Build message content
+            content = self._build_event_detection_message(
+                frames=chunk_frames,
+                start_frame_idx=start_idx,
+                transcript_text=relevant_transcript,
+            )
+            
+            requests.append({
+                "model": self.model_config.event_detection,
+                "system_prompt": EVENT_DETECTION_PROMPT,
+                "content": content,
+                "max_tokens": 4096,
+                "parse_json": True,
+                "json_type": "array",
+                "default_json": [],
+                "phase": "pass1_events",
+            })
+        
+        # Progress bar for parallel processing
+        pbar = tqdm(
+            total=total_chunks,
+            desc="Detecting events (parallel)",
+            unit="chunk",
+            disable=not verbose,
+        )
+        
+        def progress_callback(completed: int, total: int) -> None:
+            pbar.n = completed
+            pbar.refresh()
+        
+        try:
+            # Fire requests in parallel batches
+            results = self.llm.generate_batch_parallel(
+                requests=requests,
+                batch_size=5,  # Gemini free tier limit
+                batch_wait=60.0,  # Wait for rate limit reset
+                progress_callback=progress_callback,
+            )
+        finally:
+            pbar.close()
+        
+        # Parse results and merge events
+        all_events: list[DetectedEvent] = []
+        for chunk_idx, events_data in enumerate(results):
+            chunk_events = self._parse_events_from_data(events_data)
+            # Merge events, handling overlap
+            all_events = self._merge_events(all_events, chunk_events, True)
         
         return all_events
     
@@ -976,37 +1140,39 @@ class WorkflowExtractor:
         frames: list,
         start_frame_idx: int,
         transcript_text: str,
+        *,
+        tqdm_bar: Any = None,
     ) -> list[DetectedEvent]:
-        """Detect events in a single chunk of frames."""
-        # Build message content
+        """Detect events in a single chunk of frames.
+        
+        Args:
+            frames: List of frames to analyze.
+            start_frame_idx: Starting frame index in the full video.
+            transcript_text: Relevant transcript text for this chunk.
+            tqdm_bar: Optional tqdm progress bar to update with cumulative tokens.
+        """
+        # Build message content in unified format
         content = self._build_event_detection_message(
             frames=frames,
             start_frame_idx=start_frame_idx,
             transcript_text=transcript_text,
         )
         
-        # Call the appropriate API
-        if self.use_openai:
-            response_text = self._call_openai_with_prompt(
-                content, EVENT_DETECTION_PROMPT, phase="pass1_events"
-            )
-        else:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=EVENT_DETECTION_PROMPT,
-                messages=[{"role": "user", "content": content}],
-            )
-            response_text = response.content[0].text
-            # Track usage
-            self._track_usage(
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-                phase="pass1_events",
-            )
+        # Use LLMClient with the event detection model
+        events_data = self.llm.generate(
+            model=self.model_config.event_detection,
+            system_prompt=EVENT_DETECTION_PROMPT,
+            content=content,
+            max_tokens=4096,
+            parse_json=True,
+            json_type="array",
+            default_json=[],
+            tqdm_bar=tqdm_bar,
+            phase="pass1_events",
+        )
         
-        # Parse JSON response
-        return self._parse_events_response(response_text)
+        # Parse events from JSON data
+        return self._parse_events_from_data(events_data)
     
     def _build_event_detection_message(
         self,
@@ -1014,7 +1180,7 @@ class WorkflowExtractor:
         start_frame_idx: int,
         transcript_text: str,
     ) -> list[dict]:
-        """Build message content for event detection."""
+        """Build message content for event detection in unified format."""
         content = []
         
         # Add context
@@ -1028,30 +1194,22 @@ class WorkflowExtractor:
         
         content.append({"type": "text", "text": "".join(text_parts)})
         
-        # Add frames
+        # Add frames header
         content.append({
             "type": "text",
             "text": f"## Frames ({len(frames)} images)\n\n"
         })
         
         for i, frame in enumerate(frames):
-            # Resize and compress image to avoid API size limits
+            # Resize and compress image, then add in unified format
             image_data, media_type = self._resize_and_encode_image(frame.path)
             
-            if self.use_openai:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{media_type};base64,{image_data}"}
-                })
-            else:
-                content.append({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": image_data,
-                    }
-                })
+            # Unified format: image with base64 data
+            content.append({
+                "type": "image",
+                "data": image_data,
+                "media_type": media_type,
+            })
             
             content.append({
                 "type": "text",
@@ -1065,29 +1223,16 @@ class WorkflowExtractor:
         
         return content
     
-    def _call_openai_with_prompt(
-        self,
-        content: list[dict],
-        system_prompt: str,
-        phase: str = "openai",
-    ) -> str:
-        """Call OpenAI API with custom system prompt."""
-        response = self.client.chat.completions.create(
-            model=self.model,
-            max_completion_tokens=16384,  # Increased from 4096 to handle growing understanding
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ],
-        )
-        # Track usage if available
-        if response.usage:
-            self._track_usage(
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-                phase=phase,
-            )
-        return response.choices[0].message.content
+    def _parse_events_from_data(self, events_data: list) -> list[DetectedEvent]:
+        """Parse events from already-parsed JSON data."""
+        events = []
+        for event_dict in events_data:
+            try:
+                event = DetectedEvent.from_dict(event_dict)
+                events.append(event)
+            except (KeyError, ValueError) as e:
+                self._log(f"Warning: Failed to parse event: {e}", level="warning")
+        return events
     
     def _parse_events_response(self, response_text: str) -> list[DetectedEvent]:
         """Parse JSON events from model response."""
@@ -1181,10 +1326,9 @@ class WorkflowExtractor:
             batch_events = events[start_idx:end_idx]
             
             # Update progress bar description
-            batch_iterator.set_postfix({
-                "events": f"{start_idx + 1}-{end_idx}",
-                "steps": len(understanding.steps),
-            })
+            batch_iterator.set_postfix_str(
+                f"events={start_idx + 1}-{end_idx}, steps={len(understanding.steps)}"
+            )
             
             # Get transcript context for this batch's time range
             if batch_events:
@@ -1196,13 +1340,14 @@ class WorkflowExtractor:
             else:
                 transcript_context = ""
             
-            # Update understanding with this batch
+            # Update understanding with this batch (passes tqdm bar for token updates)
             understanding = self._update_understanding(
                 current_understanding=understanding,
                 new_events=batch_events,
                 transcript_context=transcript_context,
                 is_first_batch=(batch_idx == 0),
                 is_last_batch=(batch_idx == num_batches - 1),
+                tqdm_bar=batch_iterator,
             )
         
         if verbose:
@@ -1220,8 +1365,19 @@ class WorkflowExtractor:
         transcript_context: str,
         is_first_batch: bool,
         is_last_batch: bool,
+        *,
+        tqdm_bar: Any = None,
     ) -> RunningUnderstanding:
-        """Update understanding with a new batch of events."""
+        """Update understanding with a new batch of events.
+        
+        Args:
+            current_understanding: Current accumulated understanding.
+            new_events: New events to incorporate.
+            transcript_context: Relevant transcript text.
+            is_first_batch: Whether this is the first batch.
+            is_last_batch: Whether this is the last batch.
+            tqdm_bar: Optional tqdm progress bar to update with cumulative tokens.
+        """
         # Build message content
         content = self._build_understanding_message(
             current_understanding=current_understanding,
@@ -1231,25 +1387,15 @@ class WorkflowExtractor:
             is_last_batch=is_last_batch,
         )
         
-        # Call the appropriate API
-        if self.use_openai:
-            response_text = self._call_openai_with_prompt(
-                content, UNDERSTANDING_UPDATE_PROMPT, phase="pass2_understanding"
-            )
-        else:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=16384,  # Increased from 4096 to handle growing understanding
-                system=UNDERSTANDING_UPDATE_PROMPT,
-                messages=[{"role": "user", "content": content}],
-            )
-            response_text = response.content[0].text
-            # Track usage
-            self._track_usage(
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-                phase="pass2_understanding",
-            )
+        # Use LLMClient with the understanding model
+        response_text = self.llm.generate(
+            model=self.model_config.understanding,
+            system_prompt=UNDERSTANDING_UPDATE_PROMPT,
+            content=content,
+            max_tokens=16384,
+            tqdm_bar=tqdm_bar,
+            phase="pass2_understanding",
+        )
         
         # Parse the updated understanding
         return self._parse_understanding_response(
@@ -1335,25 +1481,15 @@ class WorkflowExtractor:
         
         # Use tqdm with a simple indeterminate progress (single iteration)
         with tqdm(total=1, desc="Generating workflow", unit="doc", disable=not verbose) as pbar:
-            # Call the appropriate API
-            if self.use_openai:
-                response_text = self._call_openai_with_prompt(
-                    content, WORKFLOW_SYNTHESIS_PROMPT, phase="pass3_synthesis"
-                )
-            else:
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=8192,
-                    system=WORKFLOW_SYNTHESIS_PROMPT,
-                    messages=[{"role": "user", "content": content}],
-                )
-                response_text = response.content[0].text
-                # Track usage
-                self._track_usage(
-                    response.usage.input_tokens,
-                    response.usage.output_tokens,
-                    phase="pass3_synthesis",
-                )
+            # Use LLMClient with the synthesis model
+            response_text = self.llm.generate(
+                model=self.model_config.synthesis,
+                system_prompt=WORKFLOW_SYNTHESIS_PROMPT,
+                content=content,
+                max_tokens=8192,
+                tqdm_bar=pbar,
+                phase="pass3_synthesis",
+            )
             pbar.update(1)
         
         # Parse the markdown response

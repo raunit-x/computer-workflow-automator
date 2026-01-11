@@ -87,10 +87,36 @@ class WorkflowLogger:
         self.console.print(f"[step]→[/step] {message}", **kwargs)
         self._write_to_file("STEP", message)
     
-    def api(self, input_tokens: int, output_tokens: int, **kwargs: Any) -> None:
-        """Log API token usage."""
+    def api(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        console: bool = True,
+        tqdm_bar: Any = None,
+        cumulative_in: int | None = None,
+        cumulative_out: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Log API token usage.
+        
+        Args:
+            input_tokens: Input tokens for this call.
+            output_tokens: Output tokens for this call.
+            console: Whether to print to console (set False when using tqdm).
+            tqdm_bar: Optional tqdm progress bar to update with cumulative tokens.
+            cumulative_in: Cumulative input tokens (for tqdm display).
+            cumulative_out: Cumulative output tokens (for tqdm display).
+            **kwargs: Additional kwargs for console.print.
+        """
         message = f"Tokens: {input_tokens:,} in, {output_tokens:,} out"
-        self.console.print(f"[api]⚡[/api] {message}", **kwargs)
+        
+        if tqdm_bar is not None and cumulative_in is not None:
+            # Update tqdm postfix with cumulative tokens
+            tqdm_bar.set_postfix_str(f"⚡ {cumulative_in:,} in, {cumulative_out:,} out")
+        elif console:
+            self.console.print(f"[api]⚡[/api] {message}", **kwargs)
+        
         self._write_to_file("API", message)
     
     def iteration(self, current: int, total: int, **kwargs: Any) -> None:

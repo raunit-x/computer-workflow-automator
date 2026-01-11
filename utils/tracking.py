@@ -38,6 +38,15 @@ OPENAI_PRICING: dict[str, tuple[float, float]] = {
     "gpt-4-turbo": (10.0, 30.0),
 }
 
+# Gemini model pricing per million tokens (input, output)
+# From: https://ai.google.dev/gemini-api/docs/pricing
+GEMINI_PRICING: dict[str, tuple[float, float]] = {
+    "gemini-3-flash-preview": (0.5, 3.0),
+    # Gemini 2.0 Flash
+    "gemini-2.0-flash": (0.10, 0.40),
+    "gemini-2.0-flash-exp": (0.10, 0.40),
+}
+
 # Default pricing (Claude Sonnet 4.5)
 DEFAULT_PRICING = (3.0, 15.0)
 
@@ -48,73 +57,130 @@ def get_model_pricing(model: str) -> tuple[float, float]:
         return MODEL_PRICING[model]
     if model in OPENAI_PRICING:
         return OPENAI_PRICING[model]
+    if model in GEMINI_PRICING:
+        return GEMINI_PRICING[model]
     return DEFAULT_PRICING
+
+
+def detect_provider(model: str) -> str:
+    """Detect the provider based on model name.
+    
+    Returns: "anthropic", "openai", or "gemini"
+    """
+    if model.startswith("claude"):
+        return "anthropic"
+    if model.startswith("gpt") or model.startswith("o1") or model.startswith("o3"):
+        return "openai"
+    if model.startswith("gemini"):
+        return "gemini"
+    # Default to anthropic
+    return "anthropic"
 
 
 @dataclass
 class CostTracker:
-    """Tracks API costs and token usage across multiple calls."""
+    """Tracks API costs and token usage across multiple calls.
     
-    model: str = "claude-sonnet-4-5-20250929"
+    Supports tracking usage across multiple models with per-model cost calculation.
+    """
+    
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     api_calls: int = 0
+    total_cost_dollars: float = 0.0
     
     # Per-phase tracking for analyze command
-    phase_stats: dict[str, dict[str, int]] = field(default_factory=dict)
+    phase_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    
+    # Per-model tracking
+    model_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
     
     def add_usage(
         self,
         input_tokens: int,
         output_tokens: int,
+        model: str,
         phase: str | None = None,
-    ) -> None:
+    ) -> float:
         """Record token usage from an API call.
         
         Args:
             input_tokens: Number of input tokens.
             output_tokens: Number of output tokens.
+            model: The model used for this API call.
             phase: Optional phase name (e.g., 'pass1', 'pass2', 'pass3').
+            
+        Returns:
+            The cost of this API call in dollars.
         """
+        # Calculate cost for this call
+        input_price, output_price = get_model_pricing(model)
+        call_cost = (
+            (input_tokens / 1_000_000) * input_price +
+            (output_tokens / 1_000_000) * output_price
+        )
+        
+        # Update totals
         self.total_input_tokens += input_tokens
         self.total_output_tokens += output_tokens
         self.api_calls += 1
+        self.total_cost_dollars += call_cost
         
+        # Track per-model stats
+        if model not in self.model_stats:
+            self.model_stats[model] = {"input": 0, "output": 0, "calls": 0, "cost": 0.0}
+        self.model_stats[model]["input"] += input_tokens
+        self.model_stats[model]["output"] += output_tokens
+        self.model_stats[model]["calls"] += 1
+        self.model_stats[model]["cost"] += call_cost
+        
+        # Track per-phase stats
         if phase:
             if phase not in self.phase_stats:
-                self.phase_stats[phase] = {"input": 0, "output": 0, "calls": 0}
+                self.phase_stats[phase] = {"input": 0, "output": 0, "calls": 0, "cost": 0.0, "model": model}
             self.phase_stats[phase]["input"] += input_tokens
             self.phase_stats[phase]["output"] += output_tokens
             self.phase_stats[phase]["calls"] += 1
-    
-    @property
-    def input_cost(self) -> float:
-        """Calculate input token cost in dollars."""
-        input_price, _ = get_model_pricing(self.model)
-        return (self.total_input_tokens / 1_000_000) * input_price
-    
-    @property
-    def output_cost(self) -> float:
-        """Calculate output token cost in dollars."""
-        _, output_price = get_model_pricing(self.model)
-        return (self.total_output_tokens / 1_000_000) * output_price
+            self.phase_stats[phase]["cost"] += call_cost
+        
+        return call_cost
     
     @property
     def total_cost(self) -> float:
-        """Calculate total cost in dollars."""
-        return self.input_cost + self.output_cost
+        """Get total cost in dollars."""
+        return self.total_cost_dollars
     
     def get_summary(self) -> dict[str, str]:
         """Get a summary dictionary for display."""
-        input_price, output_price = get_model_pricing(self.model)
+        # List unique models used
+        models_used = list(self.model_stats.keys())
+        models_str = ", ".join(models_used) if models_used else "None"
+        
         return {
-            "Model": self.model,
-            "Pricing": f"${input_price}/MTok in, ${output_price}/MTok out",
+            "Models Used": models_str,
             "API Calls": str(self.api_calls),
-            "Input Tokens": f"{self.total_input_tokens:,} (${self.input_cost:.4f})",
-            "Output Tokens": f"{self.total_output_tokens:,} (${self.output_cost:.4f})",
+            "Input Tokens": f"{self.total_input_tokens:,}",
+            "Output Tokens": f"{self.total_output_tokens:,}",
             "Total Cost": f"${self.total_cost:.4f}",
         }
+    
+    def get_model_summary(self) -> list[list[str]]:
+        """Get per-model breakdown for table display."""
+        rows = []
+        for model, stats in self.model_stats.items():
+            input_tokens = stats["input"]
+            output_tokens = stats["output"]
+            calls = stats["calls"]
+            cost = stats["cost"]
+            
+            rows.append([
+                model,
+                str(calls),
+                f"{input_tokens:,}",
+                f"{output_tokens:,}",
+                f"${cost:.4f}",
+            ])
+        return rows
     
     def get_phase_summary(self) -> list[list[str]]:
         """Get per-phase breakdown for table display."""
@@ -123,19 +189,16 @@ class CostTracker:
             input_tokens = stats["input"]
             output_tokens = stats["output"]
             calls = stats["calls"]
-            
-            input_price, output_price = get_model_pricing(self.model)
-            phase_cost = (
-                (input_tokens / 1_000_000) * input_price +
-                (output_tokens / 1_000_000) * output_price
-            )
+            cost = stats["cost"]
+            model = stats.get("model", "unknown")
             
             rows.append([
                 phase,
+                model,
                 str(calls),
                 f"{input_tokens:,}",
                 f"{output_tokens:,}",
-                f"${phase_cost:.4f}",
+                f"${cost:.4f}",
             ])
         return rows
 

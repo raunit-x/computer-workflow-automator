@@ -4,6 +4,7 @@ processed/
 .DS_Store
 .env
 .venv/
+logs/
 __pycache__/
 workflow_automation/processed/*
 workflow_automation/.venv/

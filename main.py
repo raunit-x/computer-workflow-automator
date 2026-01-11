@@ -16,8 +16,10 @@ import typer
 from dotenv import load_dotenv
 from rich.console import Console
 
+from config import ModelConfig
 from utils.logger import WorkflowLogger, set_logger
 from utils.tracking import CostTracker, Timer
+from utils.llm import LLMClient
 
 load_dotenv()
 
@@ -91,9 +93,13 @@ def analyze(
         Optional[Path],
         typer.Option("-o", "--output", help="Output path for workflow (without extension)"),
     ] = None,
-    model: Annotated[
+    event_model: Annotated[
         str,
-        typer.Option("-m", "--model", help="Model to use for analysis"),
+        typer.Option("--event-model", help="Model for event detection (Pass 1) - fast/cheap"),
+    ] = "gemini-3-flash-preview",
+    synthesis_model: Annotated[
+        str,
+        typer.Option("--synthesis-model", "-m", help="Model for understanding/synthesis (Pass 2/3)"),
     ] = "claude-sonnet-4-5-20250929",
     max_frames: Annotated[
         int,
@@ -103,12 +109,17 @@ def analyze(
         bool,
         typer.Option("--skip-params", help="Skip automatic parameter detection"),
     ] = False,
-    use_openai: Annotated[
+    cost_optimized: Annotated[
         bool,
-        typer.Option("--use-openai", help="Use OpenAI API instead of Anthropic"),
-    ] = False,
+        typer.Option("--cost-optimized", help="Use cost-optimized model configuration"),
+    ] = True,
 ) -> None:
-    """Analyze a video recording and extract workflow."""
+    """Analyze a video recording and extract workflow.
+    
+    Uses a multi-model approach for cost optimization:
+    - Pass 1 (Event Detection): Uses fast/cheap model (default: gemini-3-flash-preview)
+    - Pass 2/3 (Understanding/Synthesis): Uses stronger model (default: claude-sonnet-4-5)
+    """
     from analyzer.workflow_extractor import WorkflowExtractor
     from analyzer.parameter_detector import ParameterDetector
     
@@ -121,24 +132,32 @@ def analyze(
         console.print(f"[yellow]⚠[/yellow] Unsupported video format: {video.suffix}")
         console.print("Supported formats: .mov, .mp4, .m4v, .avi, .mkv")
     
-    # Set default model based on provider
-    if use_openai and model == "claude-sonnet-4-5-20250929":
-        model = "gpt-5-mini-2025-08-07"
+    # Create model configuration
+    if cost_optimized:
+        model_config = ModelConfig.cost_optimized()
+    else:
+        model_config = ModelConfig.all_same(synthesis_model)
+    
+    # Override with explicit CLI options if provided
+    model_config.event_detection = event_model
+    model_config.understanding = synthesis_model
+    model_config.synthesis = synthesis_model
+    model_config.parameter_detection = synthesis_model
     
     # Initialize logger and tracking
     logger = WorkflowLogger("analyze")
     set_logger(logger)
-    cost_tracker = CostTracker(model=model)
+    cost_tracker = CostTracker()
+    llm_client = LLMClient(cost_tracker, logger)
     timer = Timer("Analysis")
     
     try:
         timer.start()
         
-        provider = "OpenAI" if use_openai else "Anthropic"
         logger.header("Workflow Analysis")
         logger.info(f"Video: [cyan]{video}[/cyan]")
-        logger.info(f"Provider: [cyan]{provider}[/cyan]")
-        logger.info(f"Model: [cyan]{model}[/cyan]")
+        logger.info(f"Event Model (Pass 1): [cyan]{model_config.event_detection}[/cyan]")
+        logger.info(f"Synthesis Model (Pass 2/3): [cyan]{model_config.synthesis}[/cyan]")
         
         # Determine output path
         if output:
@@ -154,10 +173,9 @@ def analyze(
         logger.step("Processing video (extracting frames and audio)...")
         
         extractor = WorkflowExtractor(
-            model=model,
-            use_openai=use_openai,
+            model_config=model_config,
+            llm_client=llm_client,
             logger=logger,
-            cost_tracker=cost_tracker,
         )
         
         try:
@@ -180,7 +198,10 @@ def analyze(
         # Detect additional parameters if not skipped
         if not skip_params and workflow.instructions:
             logger.step("Detecting additional parameters...")
-            detector = ParameterDetector(model=model, use_openai=use_openai)
+            detector = ParameterDetector(
+                model_config=model_config,
+                llm_client=llm_client,
+            )
             suggested = detector.detect_parameters(workflow)
             
             for param in suggested:
@@ -205,8 +226,17 @@ def analyze(
         if cost_tracker.phase_stats:
             logger.table(
                 "Cost by Phase",
-                ["Phase", "API Calls", "Input Tokens", "Output Tokens", "Cost"],
+                ["Phase", "Model", "Calls", "Input", "Output", "Cost"],
                 cost_tracker.get_phase_summary(),
+            )
+            logger.print()
+        
+        # Cost breakdown by model
+        if cost_tracker.model_stats:
+            logger.table(
+                "Cost by Model",
+                ["Model", "Calls", "Input Tokens", "Output Tokens", "Cost"],
+                cost_tracker.get_model_summary(),
             )
             logger.print()
         
@@ -276,7 +306,7 @@ def run(
     # Initialize logger and tracking
     logger = WorkflowLogger("run")
     set_logger(logger)
-    cost_tracker = CostTracker(model=model)
+    cost_tracker = CostTracker()
     timer = Timer("Execution")
     
     try:
@@ -309,7 +339,7 @@ def run(
             logger.iteration(iteration, total)
         
         def api_callback(input_tokens: int, output_tokens: int) -> None:
-            cost_tracker.add_usage(input_tokens, output_tokens)
+            cost_tracker.add_usage(input_tokens, output_tokens, model=model)
             logger.api(input_tokens, output_tokens)
         
         runner = WorkflowRunner(

@@ -196,7 +196,7 @@ async def workflow_sampling_loop(
         
         # Track costs
         if cost_tracker:
-            cost_tracker.add_usage(input_tokens, output_tokens)
+            cost_tracker.add_usage(input_tokens, output_tokens, model=model)
         
         if api_usage_callback:
             api_usage_callback(input_tokens, output_tokens)
